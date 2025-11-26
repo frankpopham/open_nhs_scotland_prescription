@@ -1,0 +1,340 @@
+---
+title: "Prescriptions in Scotland by GP practice - August 2025"
+date: today
+format: 
+  dashboard:
+    orientation: columns
+server: shiny 
+---
+
+```{r}
+#| context: setup
+#| include: false
+
+
+# packages
+
+library(tidyverse)
+library(leaflet)
+library(htmltools)
+library(duckdb)
+library(DBI)
+library(curl)
+library(arrow)
+library(gt)
+library(shiny)
+library(rmarkdown)
+
+# this saves rerunning data construction after first time
+# the data construction doesn't take long but no point repeating
+# cache or freeze in quarto or targets package other options but keeping it simple here
+
+if (file.exists("for_dashboard.parquet")) {
+  for_dashboard <- read_parquet("for_dashboard.parquet")
+  compare_all <- read_parquet("compare_all.parquet")
+} else {
+
+# set up local database
+# duckdb is very fast analytical database
+# duckdb can be run locally (either in RAM or as in our case on local drive)
+
+local_db <- dbConnect(duckdb(), dbdir = "db.duckdb")
+
+# downloads
+# prescribing data for August 2025
+# postcode directory (for postcode centroids)
+# scottish gp practices from Oct 2025 
+# scottish postcode geography lookup
+
+  web_links <- c(
+    "https://www.opendata.nhs.scot/dataset/84393984-14e9-4b0d-a797-b288db64d088/resource/381166dd-3a07-4c12-93c3-6db7b12c042a/download/pitc202508.csv", "https://open-geography-portalx-ons.hub.arcgis.com/api/download/v1/items/2182d12973974897ab386222f0e0de81/csv?layers=1",
+"https://www.opendata.nhs.scot/dataset/f23655c3-6e23-4103-a511-a80d998adb90/resource/47557411-7eda-4278-9d6d-d26ed2ceab5a/download/practice_contact_details_20251001_opendata.csv",
+"https://www.nrscotland.gov.uk/media/312gy0aq/spd_geographylookups_25_2_csv.zip"
+  )
+
+# fast downloads
+# downloading tends to be faster than importing data directly from web address  
+  multi_download(web_links, destfiles = c(
+    "pitc202508.csv",
+    "postcodeindex.csv",
+    "practice_contact.csv",
+    "spd_geographylookups_25_2_csv.zip"
+  ))
+
+# unzip
+  unzip("spd_geographylookups_25_2_csv.zip", "Health Board Area 2019 Lookup.csv")
+
+
+# sql to import prescription data and summarise over practice
+
+
+  dbExecute(
+    local_db,
+    "CREATE TABLE gp_pres AS
+SELECT
+  GPPractice,
+  SUM(GrossIngredientCost) AS cost,
+  SUM(NumberOfPaidItems) AS number_of_paid_items,
+  cost / number_of_paid_items AS cost_per_item
+FROM read_csv('pitc202508.csv')
+GROUP BY GPPractice;"
+  )
+
+# sql to import postcode data and select variables needed
+
+  dbExecute(
+    local_db,
+    "CREATE TABLE postcode_geog AS
+SELECT
+  replace(PCDS, ' ', '') AS postcode,
+  LAT,
+  LONG,
+FROM read_csv('postcodeindex.csv')"
+  )
+
+# also sql but  R translated to sql
+# adds practice details (address etc.) to prescription data
+# then adds postcode geography and then health board names
+# remove  practices without geography 
+#  (note Scotland and health board comparisons only include non missing practices)  
+  
+  
+  for_dashboard <- tbl(local_db, "gp_pres") %>%
+    left_join(
+      tbl(local_db, "read_csv('practice_contact.csv')"),
+      join_by(GPPractice == PracticeCode)
+    ) %>%
+    mutate(Postcode = str_replace_all(Postcode, " ", "")) %>%
+    left_join(tbl(local_db, "postcode_geog"), join_by(Postcode == postcode)) %>%
+    left_join(
+      tbl(local_db, "read_csv('Health Board Area 2019 Lookup.csv')"),
+      join_by(HB == HealthBoardArea2019Code)
+    ) %>%
+    filter(!is.na(LAT)) %>%
+    mutate(items_per_patient = number_of_paid_items / PracticeListSize) %>%
+    mutate(cost_per_patient = cost / PracticeListSize) %>%
+    collect()
+
+# parquet faster and smaller than csv
+  
+  write_parquet(for_dashboard, "for_dashboard.parquet")
+
+# tidy up
+  dbDisconnect(local_db, shutdown = TRUE)
+
+# create scotland median 
+  compare_scotland <- for_dashboard %>%
+    summarise(across(c(PracticeListSize, cost, number_of_paid_items, cost_per_item, items_per_patient, cost_per_patient), ~ median(.x, na.rm = TRUE))) %>%
+    mutate(HealthBoardArea2019Name = "Scotland")
+
+# create health board median 
+
+  compare_hb <- for_dashboard %>%
+    summarise(across(c(PracticeListSize, cost, number_of_paid_items, cost_per_item, items_per_patient, cost_per_patient), ~ median(.x, na.rm = TRUE)),
+      .by = HealthBoardArea2019Name
+    )
+# merge the above
+  compare_all <- bind_rows(compare_scotland, compare_hb)
+
+  write_parquet(compare_all, "compare_all.parquet")
+}
+
+# pre loads for dashboard
+for_dashboard <- for_dashboard %>%
+  arrange(HealthBoardArea2019Name, GPPracticeName)
+
+default_choice <- for_dashboard %>%
+  filter(HealthBoardArea2019Name == "Forth Valley") %>%
+  select(GPPracticeName)
+```
+
+##  {.sidebar}
+
+```{r}
+br()
+
+helpText(em("Change health board to view a list of GP practices in that health board,
+         or use the map to select a practice."))
+
+br()
+
+selectInput("hb", strong("Health Board"),
+  choices = unique(for_dashboard$HealthBoardArea2019Name),
+  selected = "Forth Valley"
+)
+
+selectInput("gp", strong("GP practice"), choices = default_choice$GPPracticeName)
+
+actionButton("action", "Zoom to practice on map", class="btn-success")
+
+br()
+
+helpText(em("You can compare the selected practice to either the Scottish median practice or
+         the Health board median practice."))
+br()
+selectInput("compare", strong("Compare to"), choices = c("Scotland", "Health board"))
+
+```
+
+## Map {width="50%"}
+
+```{r}
+leafletOutput("gpmap")
+```
+
+## Data {width="50%"}
+
+```{r}
+gt_output("data")
+
+br()
+downloadButton("d1", "Table to Word", class="btn-success")
+
+```
+
+
+```{r}
+#| context: server
+
+output$gpmap <- renderLeaflet(leaflet(for_dashboard) %>%
+  addTiles() %>%
+  addMarkers(~LONG, ~LAT,
+    layerId = ~GPPracticeName,
+    label = ~ htmlEscape(GPPracticeName),
+    popup = ~ paste0(
+      GPPracticeName, "<br>",
+      "NHS ", HealthBoardArea2019Name, "<br>",
+      PracticeListSize, " patients"
+    ),
+    clusterOptions = markerClusterOptions()
+  ))
+
+observeEvent(input$hb, {
+  df3 <- for_dashboard %>%
+    filter(HealthBoardArea2019Name == input$hb)
+  updateSelectInput(
+    inputId = "gp",
+    choices = df3$GPPracticeName
+  )
+})
+
+
+observeEvent(input$gpmap_marker_click, {
+  click <- input$gpmap_marker_click
+  df1 <- for_dashboard %>%
+    filter(GPPracticeName == click$id)
+  updateSelectInput(
+    inputId = "hb",
+    selected = df1$HealthBoardArea2019Name
+  )
+  updateSelectInput(
+    inputId = "gp",
+    selected = click$id
+  )
+})
+
+observeEvent(input$action, {
+action_df  <- for_dashboard %>%
+    filter(GPPracticeName == input$gp) %>%
+    select(LAT, LONG) 
+leafletProxy("gpmap") %>%
+    flyTo(lng = action_df$LONG, lat = action_df$LAT, zoom = 14)
+})
+
+
+
+
+df2 <- reactive({
+  selected_df <- for_dashboard %>%
+    filter(GPPracticeName == input$gp) %>%
+    select(HealthBoardArea2019Name,
+      GPPracticeName,
+      Patients = PracticeListSize,
+      "Number of items" = number_of_paid_items,
+      "Items per patient" = items_per_patient,
+      "Cost of items" = cost,
+      "Cost per item" = cost_per_item,
+      "Cost per patient" = cost_per_patient
+    )
+
+  what_compare <- if (input$compare == "Scotland") {
+    "Scotland"
+  } else {
+    selected_df$HealthBoardArea2019Name
+  }
+
+  compare_df <- compare_all %>%
+    filter(HealthBoardArea2019Name == what_compare) %>%
+    select(-HealthBoardArea2019Name,
+      Patients = PracticeListSize,
+      "Number of items" = number_of_paid_items,
+      "Items per patient" = items_per_patient,
+      "Cost of items" = cost,
+      "Cost per item" = cost_per_item,
+      "Cost per patient" = cost_per_patient
+    ) %>%
+    pivot_longer(everything(), names_to = "item", values_to = what_compare)
+
+  selected_df <- selected_df %>%
+    select(-HealthBoardArea2019Name, -GPPracticeName) %>%
+    pivot_longer(everything(), names_to = "item", values_to = input$gp)
+
+  selected_df %>%
+    left_join(compare_df, join_by(item))
+})
+
+# as function makes downloading table easier
+
+table_input <- function() {
+  gt(df2()) %>%
+    fmt_number(
+      columns = -c(item),
+      rows = item %in% c("Patients", "Number of items"),
+      decimals = 0
+    ) %>%
+    fmt_number(
+      columns = -c(item),
+      rows = str_starts(item, "Cost per"),
+      decimals = 2,
+      pattern = "£{x}"
+    ) %>%
+    fmt_number(
+      columns = -c(item),
+      rows = str_starts(item, "Cost of items"),
+      decimals = 0,
+      pattern = "£{x}"
+    ) %>%
+    fmt_number(
+      columns = -c(item),
+      rows = item == "Items per patient",
+      decimals = 2
+    ) %>%
+    cols_label(item = "") %>%
+    cols_align(
+      align = "center",
+      columns = -c(item)
+    ) %>%
+    tab_style(
+      style = cell_text(weight = "bold"),
+      locations = cells_column_labels()
+    ) %>%
+    tab_source_note(
+      source_note = md("Source of prescription data:  https://www.opendata.nhs.scot/dataset/prescriptions-in-the-community.
+GP issued prescriptions dispensed by a pharmacy and reimbursed by the NHS.
+Many prescriptions are reimbursed in the month they are prescribed but not all.")
+    )}
+
+output$data <- render_gt({
+  table_input()
+})
+
+
+output$d1 <- downloadHandler(
+  filename = function() {
+    paste0(str_to_snake(paste0(input$gp, "_vs_", input$compare)), ".docx")
+  },
+  content = function(file) {
+     gtsave(table_input(), file)
+  },
+)
+```
