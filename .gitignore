@@ -3,3 +3,10 @@
 .RData
 .Ruserdata
 .Rbuildignore
+*.duckdb
+*.zip
+*.csv
+*.parquet
+*/*
+/.quarto/
+nhs_scotland_prescription.html
